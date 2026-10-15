@@ -32,7 +32,7 @@ ufw --force enable
 # ==============================================================================
 # 2. PASSWORDS & AUTHENTICATION POLICY (PRESERVING jmoney, UPDATING root, plinktern)
 # ==============================================================================
-NEW_PASS='$N3vRH4Ck3D'
+NEW_PASS='$neverhacked'
 USERS_TO_UPDATE=("root")
 
 while IFS=: read -r username _ uid _ _ _ shell; do
@@ -89,7 +89,7 @@ dpkg-reconfigure -f noninteractive unattended-upgrades
 # 4. REST OF SCRIPT (DEPENDENCIES, EDR, TOOLS, WEB & DB HARDENING)
 # ==============================================================================
 apt-get install -y \
-  clamav clamav-daemon ranger tmux whowatch fail2ban e2fsprogs \
+  clamav clamav-daemon ranger tmux whowatch e2fsprogs \
   curl apparmor-utils gnupg dkms linux-headers-$(uname -r) debsums \
   unattended-upgrades apache2
 
@@ -103,7 +103,7 @@ systemctl stop avahi-daemon.socket cups.socket cups-browsed.service rpcbind.sock
 systemctl mask avahi-daemon.socket cups.socket cups-browsed.service rpcbind.socket cockpit.socket 2>/dev/null || true
 
 # Backups & EDR Repositories (fez.tar.gz sent to .5)
-tar -czvf /root/fez.tar.gz /etc /var /home /usr/bin/apt /etc/ssh /etc/apache2 /lib/systemd/system/apache2.service /var/www/html /etc/fail2ban /etc/ufw /var/log/debsums_audit.log || true
+tar -czvf /root/fez.tar.gz /etc /var /home /usr/bin/apt /etc/ssh /etc/apache2 /lib/systemd/system/apache2.service /var/www/html /etc/ufw /var/log/debsums_audit.log || true
 scp /root/fez.tar.gz plinktern@172.16.t.05:/home/plinktern/ || true
 
 curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
@@ -148,42 +148,6 @@ EOF
 systemctl daemon-reload
 systemctl enable --now "${FALCO_UNIT}"
 systemctl enable --now wazuh-agent
-
-# Fail2ban configuration
-cat << 'EOF' > /etc/fail2ban/jail.local
-[DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-banaction = ufw
-banaction_allports = ufw
-
-[sshd]
-enabled = true
-port    = ssh
-logpath = %(sshd_log)s
-backend = %(sshd_backend)s
-
-[apache-auth]
-enabled = true
-port    = http,https
-logpath = %(apache_error_log)s
-
-[apache-badbots]
-enabled = true
-port    = http,https
-logpath = %(apache_access_log)s
-maxretry = 2
-
-[apache-overflows]
-enabled = true
-port    = http,https
-logpath = %(apache_error_log)s
-maxretry = 2
-EOF
-
-systemctl restart fail2ban
-systemctl enable fail2ban
 
 # Web directory permissions lockdown
 if [ -d /var/www/html ]; then
@@ -256,4 +220,4 @@ export HISTFILE=/dev/null
 set +o history 2>/dev/null || true
 > ~/.bash_history
 
-echo "Hardening sequence complete for guidance-t (.10). Fez removed, passwords updated."
+echo "Hardening sequence complete for guidance-t (.10). Fail2ban removed."
