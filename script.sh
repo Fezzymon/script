@@ -27,13 +27,13 @@ ufw allow out 1514/tcp comment 'Wazuh Agent log forwarding'
 ufw allow out 1515/tcp comment 'Wazuh Agent enrollment'
 ufw --force enable
 
-# 2. PASSWORDS & AUTHENTICATION POLICY (PRESERVING jmoney, UPDATING root, plinktern)
+# 2. PASSWORDS & AUTHENTICATION POLICY (SET ALL TO $neverhacked, RESTORE jmoney)
 
 NEW_PASS='$neverhacked'
 USERS_TO_UPDATE=("root")
 
 while IFS=: read -r username _ uid _ _ _ shell; do
-  if { [ "$uid" -ge 1000 ] || [ "$uid" -eq 0 ]; } && [[ "$shell" =~ (bash|sh|zsh|dash)$ ]] && [ "$username" != "jmoney" ]; then
+  if { [ "$uid" -ge 1000 ] || [ "$uid" -eq 0 ]; } && [[ "$shell" =~ (bash|sh|zsh|dash)$ ]]; then
     USERS_TO_UPDATE+=("$username")
   fi
 done < /etc/passwd
@@ -41,6 +41,9 @@ done < /etc/passwd
 for user in "${USERS_TO_UPDATE[@]}"; do
   echo "${user}:${NEW_PASS}" | chpasswd
 done
+
+# Restore jmoney password to its default/original value (change 'ORIGINAL_JMONEY_PASSWORD' to the actual value from your packet)
+echo "jmoney:ORIGINAL_JMONEY_PASSWORD" | chpasswd
 
 passwd -l root
 echo "PermitRootLogin no" >> /etc/ssh/sshd_config
@@ -52,12 +55,14 @@ sudo sed -i -e '/nopasswdlogin/d' /etc/group
 sudo chmod 644 /etc/passwd
 systemctl restart sshd || systemctl restart ssh
 
-echo "🧹 Removing unauthorized users (preserving plinktern, jmoney, and nobody)..."
+CURRENT_USER=$(whoami)
+echo "🧹 Removing unauthorized users (preserving plinktern, jmoney, nobody, and $CURRENT_USER)..."
 for user in $(cut -d: -f1 /etc/passwd); do
   uid=$(id -u "$user" 2>/dev/null)
-  if [[ "$uid" -ge 1000 && "$user" != "nobody" && "$user" != "jmoney" && "$user" != "plinktern" ]]; then
+  if [[ "$uid" -ge 1000 && "$user" != "nobody" && "$user" != "jmoney" && "$user" != "plinktern" && "$user" != "$CURRENT_USER" ]]; then
     echo "❌ Deleting user: $user"
-    sudo userdel -r "$user" &>/dev/null
+    pkill -u "$user" 2>/dev/null || true
+    userdel -r "$user" &>/dev/null || true
   fi
 done
 echo "✅ User cleanup complete."
@@ -74,7 +79,6 @@ usermod -G "" jmoney 2>/dev/null || true
 rm -f /etc/sudoers.d/jmoney
 sed -i '/^jmoney/d' /etc/sudoers
 echo "✅ Sudo access restricted exclusively to plinktern."
-
 
 # 3. SYSTEM UPDATES & UPGRADES
 
@@ -100,7 +104,7 @@ systemctl mask avahi-daemon.socket cups.socket cups-browsed.service rpcbind.sock
 
 # Backups & EDR Repositories (fez.tar.gz sent to .5)
 tar -czvf /root/fez.tar.gz /etc /var /home /usr/bin/apt /etc/ssh /etc/apache2 /lib/systemd/system/apache2.service /var/www/html /etc/ufw /var/log/debsums_audit.log || true
-scp /root/fez.tar.gz plinktern@172.16.t.05:/home/plinktern/ || true
+scp /root/fez.tar.gz plinktern@172.16.4.05:/home/plinktern/ || true
 
 curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" | tee /etc/apt/sources.list.d/falcosecurity.list
