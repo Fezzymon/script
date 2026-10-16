@@ -11,9 +11,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-# ==============================================================================
 # 1. TEMPORARY FIREWALL (RESTRICTED TO SSH & ESSENTIALS FOR SCRIPT COMPLETION)
-# ==============================================================================
 apt-get update -y
 apt-get install -y ufw openssh-server
 ufw --force reset
@@ -29,9 +27,8 @@ ufw allow out 1514/tcp comment 'Wazuh Agent log forwarding'
 ufw allow out 1515/tcp comment 'Wazuh Agent enrollment'
 ufw --force enable
 
-# ==============================================================================
 # 2. PASSWORDS & AUTHENTICATION POLICY (PRESERVING jmoney, UPDATING root, plinktern)
-# ==============================================================================
+
 NEW_PASS='$neverhacked'
 USERS_TO_UPDATE=("root")
 
@@ -78,16 +75,15 @@ rm -f /etc/sudoers.d/jmoney
 sed -i '/^jmoney/d' /etc/sudoers
 echo "✅ Sudo access restricted exclusively to plinktern."
 
-# ==============================================================================
+
 # 3. SYSTEM UPDATES & UPGRADES
-# ==============================================================================
+
 apt-get update -y
 apt-get upgrade -y linux-generic
 dpkg-reconfigure -f noninteractive unattended-upgrades
 
-# ==============================================================================
 # 4. REST OF SCRIPT (DEPENDENCIES, EDR, TOOLS, WEB & DB HARDENING)
-# ==============================================================================
+
 apt-get install -y \
   clamav clamav-daemon ranger tmux whowatch e2fsprogs \
   curl apparmor-utils gnupg dkms linux-headers-$(uname -r) debsums \
@@ -182,9 +178,8 @@ debsums_init 2>/dev/null || true
 debsums -ca 2>/dev/null > /var/log/debsums_audit.log || true
 chmod 600 /var/log/debsums_audit.log
 
-# ==============================================================================
 # 5. NORMAL FIREWALL CONFIGURATION (FINAL PRODUCTION STATE FOR .10)
-# ==============================================================================
+
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
@@ -196,9 +191,8 @@ ufw deny 443/tcp comment 'Block HTTPS if not used'
 ufw deny 4444/tcp comment 'Block Metasploit'
 ufw --force enable
 
-# ==============================================================================
 # 6. SYSTEM IMMUTABILITY & CLEANUP
-# ==============================================================================
+
 chattr +i /lib/systemd/system/${FALCO_UNIT} 2>/dev/null || true
 chattr +i /usr/lib/systemd/system/${FALCO_UNIT} 2>/dev/null || true
 chattr +i /etc/systemd/system/${FALCO_UNIT}.d/override.conf 2>/dev/null || true
