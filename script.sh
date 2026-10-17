@@ -1,240 +1,144 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+# Ubuntu 22.04 Blue Team Hardening Script
 
-# Ensure script deletes itself on exit to avoid leaving credentials on disk
-trap 'rm -f -- "$0"' EXIT
-
-if [ "$EUID" -ne 0 ]; then
-  echo "Error: This script must be run as root." >&2
-  exit 1
+if [[ $EUID -ne 0 ]]; then
+   echo "Error: This script must be run as root." 
+   exit 1
 fi
 
-export DEBIAN_FRONTEND=noninteractive
+SCRIPT_PATH="$(realpath "$0")"
+TARGET_PASS='plink$1234'
+ALLOWED_USERS=("jmoney" "plinktern")
 
-# ==============================================================================
-# 1. TEMPORARY FIREWALL (RESTRICTED TO SSH & ESSENTIALS FOR SCRIPT COMPLETION)
-# ==============================================================================
-apt-get update -y
-apt-get install -y ufw
+echo "[*] Backing up critical auth files to /root/.backup_auth..."
+mkdir -p /root/.backup_auth
+cp /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/ssh/sshd_config /root/.backup_auth/
+chmod 600 /root/.backup_auth/*
+
+# 1. User Management & Password Enforcement
+echo "[*] Ensuring allowed users exist and setting passwords..."
+for user in "${ALLOWED_USERS[@]}"; do
+    if ! id "$user" &>/dev/null; then
+        useradd -m -s /bin/bash "$user"
+    fi
+    # Single quotes around TARGET_PASS prevent $1234 variable expansion
+    echo "${user}:${TARGET_PASS}" | chpasswd
+    passwd -u "$user" 2>/dev/null
+done
+
+# Ensure root has the known password so it isn't passwordless
+echo "root:${TARGET_PASS}" | chpasswd
+
+echo "[*] Removing unauthorized human users (UID >= 1000)..."
+# Only target standard users (UID >= 1000) to avoid breaking system/Apache daemons (www-data, sshd, etc.)
+awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd | while read -r user; do
+    if [[ "$user" != "jmoney" && "$user" != "plinktern" ]]; then
+        echo "[-] Deleting unauthorized user: $user"
+        pkill -KILL -u "$user" 2>/dev/null
+        userdel -r -f "$user" 2>/dev/null
+    fi
+done
+
+echo "[*] Locking passwordless accounts and enforcing password requirement..."
+# Lock any system account that has an empty password field in /etc/shadow
+awk -F: '($2 == "" ) {print $1}' /etc/shadow | while read -r empty_user; do
+    if [[ "$empty_user" != "jmoney" && "$empty_user" != "plinktern" && "$empty_user" != "root" ]]; then
+        passwd -l "$empty_user" 2>/dev/null
+    fi
+done
+
+# Remove nullok from PAM so blank passwords cannot authenticate anywhere
+sed -i 's/\bnullok\b//g' /etc/pam.d/common-auth
+sed -i 's/\bnullok_secure\b//g' /etc/pam.d/common-auth
+
+# 2. Firewall Configuration (UFW) & Apache2
+echo "[*] Configuring UFW for SSH (22) and Apache2 (80, 443)..."
+apt-get update -y && apt-get install -y ufw apache2
+
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
-
-# Allow SSH and necessary outbound/inbound connectivity for script downloads & repos
-ufw allow in 22/tcp comment 'Allow SSH'
-ufw allow out 53/udp comment 'DNS'
-ufw allow out 53/tcp comment 'DNS'
-ufw allow out 80/tcp comment 'HTTP repos'
-ufw allow out 443/tcp comment 'HTTPS repos'
-ufw allow out 1514/tcp comment 'Wazuh Agent log forwarding'
-ufw allow out 1515/tcp comment 'Wazuh Agent enrollment'
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
 ufw --force enable
 
-# ==============================================================================
-# 2. PASSWORDS & AUTHENTICATION POLICY FIRST
-# ==============================================================================
-apt-get install -y libpam-pwquality
+echo "[*] Ensuring Apache2 service is active..."
+systemctl enable apache2
+systemctl restart apache2
 
-passwd -l root
-echo "PermitRootLogin no" >> /etc/ssh/sshd_config
-echo "Protocol 2" >> /etc/ssh/sshd_config
-echo "AllowUsers jmoney plinktern" >> /etc/ssh/sshd_config
+# 3. SSH Hardening
+echo "[*] Hardening SSH configuration..."
+SSHD_CONF="/etc/ssh/sshd_config"
 
-echo "Removing nopasswdlogin group"
-sudo sed -i -e '/nopasswdlogin/d' /etc/group
-sudo chmod 644 /etc/passwd
-systemctl restart ssh
+# Remove conflicting directives in drop-in directory (Ubuntu 22.04 often overrides PasswordAuthentication here)
+rm -f /etc/ssh/sshd_config.d/*.conf
 
-# Disable empty/null passwords globally via PAM configuration
-sed -i 's/\bnullok\b//g' /etc/pam.d/common-auth 2>/dev/null || true
-sed -i 's/\bnullok\b//g' /etc/pam.d/common-password 2>/dev/null || true
+sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONF"
+sed -i -E 's/^#?PermitEmptyPasswords.*/PermitEmptyPasswords no/' "$SSHD_CONF"
+sed -i -E 's/^#?PubkeyAuthentication.*/PubkeyAuthentication no/' "$SSHD_CONF"
+sed -i -E 's/^#?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' "$SSHD_CONF"
+sed -i -E 's/^#?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$SSHD_CONF"
+sed -i -E 's/^#?PermitRootLogin.*/PermitRootLogin no/' "$SSHD_CONF"
+sed -i -E 's/^#?UsePAM.*/UsePAM yes/' "$SSHD_CONF"
 
-# Enforce strict password quality standards for new passwords and user creation
-cat << 'EOF' > /etc/security/pwquality.conf
-minlen = 10
-minclass = 3
-retry = 3
-enforce_for_root
-EOF
+# Explicitly append directives if they weren't present in the file
+grep -q "^PasswordAuthentication" "$SSHD_CONF" || echo "PasswordAuthentication yes" >> "$SSHD_CONF"
+grep -q "^PermitEmptyPasswords" "$SSHD_CONF" || echo "PermitEmptyPasswords no" >> "$SSHD_CONF"
+grep -q "^PubkeyAuthentication" "$SSHD_CONF" || echo "PubkeyAuthentication no" >> "$SSHD_CONF"
 
-# Enforce secure login defaults in /etc/login.defs
-sed -i 's/^PASS_MIN_LEN.*/PASS_MIN_LEN   10/' /etc/login.defs
-sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   90/' /etc/login.defs
+# Restrict SSH login strictly to the two required accounts
+sed -i '/^AllowUsers/d' "$SSHD_CONF"
+echo "AllowUsers jmoney plinktern" >> "$SSHD_CONF"
 
-# Set the secure password for all users (including jmoney, fez, root, and plinktern)
-NEW_USER_PASS='$neverhacked'
-echo "Updating passwords for all local users..."
-while IFS=: read -r username _ uid _ _ _ shell; do
-  if [ "$uid" -ge 1000 ] || [ "$uid" -eq 0 ]; then
-    echo "${username}:${NEW_USER_PASS}" | chpasswd
-    echo "Password updated for: $username"
-  fi
-done < /etc/passwd
+# Wipe authorized_keys to prevent key-based backdoors
+rm -rf /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null
 
-echo "🧹 Removing all users except plinktern, jmoney, and nobody..."
-for user in $(cut -d: -f1 /etc/passwd); do
-  uid=$(id -u "$user" 2>/dev/null)
-  if [[ "$uid" -ge 1000 && "$user" != "nobody" && "$user" != "jmoney" && "$user" != "plinktern" ]]; then
-    echo "❌ Deleting user: $user"
-    sudo userdel -r "$user" &>/dev/null
-  fi
-done
-echo "✅ User cleanup complete."
-
-# Privilege Management (Only plinktern allowed sudo)
-echo "🔧 Configuring sudo access (plinktern only)..."
-usermod -aG sudo plinktern
-for user in $(cut -d: -f1 /etc/passwd); do
-  if [[ "$user" != "plinktern" && "$user" != "root" ]]; then
-    gpasswd -d "$user" sudo &>/dev/null || true
-  fi
-done
-usermod -G "" jmoney 2>/dev/null || true
-rm -f /etc/sudoers.d/jmoney
-sed -i '/^jmoney/d' /etc/sudoers
-echo "✅ Sudo access restricted exclusively to plinktern."
-
-# ==============================================================================
-# 3. SYSTEM UPDATES & UPGRADES
-# ==============================================================================
-apt-get update -y
-apt-get upgrade -y linux-generic
-dpkg-reconfigure -f noninteractive unattended-upgrades
-
-# ==============================================================================
-# 4. REST OF SCRIPT (DEPENDENCIES, EDR, TOOLS, WEB & DB HARDENING)
-# ==============================================================================
-apt-get install -y \
-  clamav clamav-daemon ranger tmux whowatch e2fsprogs \
-  curl apparmor-utils gnupg dkms linux-headers-$(uname -r) debsums \
-  unattended-upgrades apache2
-
-# Purge attack surface
-apt-get purge -y --auto-remove \
-  cups cups-browsed avahi-daemon rpcbind snapd \
-  apport whoopsie modemmanager gcc g++ make netcat-traditional \
-  netcat-openbsd socat cockpit cockpit-bridge cockpit-ws 2>/dev/null || true
-
-systemctl stop avahi-daemon.socket cups.socket cups-browsed.service rpcbind.socket cockpit.socket 2>/dev/null || true
-systemctl mask avahi-daemon.socket cups.socket cups-browsed.service rpcbind.socket cockpit.socket 2>/dev/null || true
-
-# Backups & EDR Repositories (Targeting Apache 2, Web App, UFW, and Audits sent to .45 as fez.tar.gz)
-tar -czvf /root/fez.tar.gz /etc /var /home /usr/bin/apt /etc/ssh /etc/apache2 /lib/systemd/system/apache2.service /var/www/html /etc/ufw /var/log/debsums_audit.log || true
-scp /root/fez.tar.gz plinktern@172.16.4.05:/home/plinktern/ || true
-
-curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" | tee /etc/apt/sources.list.d/falcosecurity.list
-
-curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --dearmor -o /usr/share/keyrings/wazuh.gpg
-echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" | tee /etc/apt/sources.list.d/wazuh.list
-
-apt-get update -y
-
-echo "wireshark-common wireshark-common/install-setuid boolean true" | debconf-set-selections
-apt-get install -y tshark wireshark-common
-groupadd -f wireshark
-
-apt-get install -y falco
-WAZUH_MANAGER="127.0.0.1" apt-get install -y wazuh-agent
-
-# Lock user creation & core files
-chmod 700 /usr/sbin/useradd /usr/sbin/adduser /usr/sbin/newusers 2>/dev/null || true
-chattr +i /etc/passwd /etc/shadow /etc/group /etc/gshadow
-
-# EDR Service Resiliency
-FALCO_UNIT=$(systemctl show -p Id falco 2>/dev/null | cut -d= -f2 || true)
-if [ -z "$FALCO_UNIT" ]; then
-  FALCO_UNIT="falco.service"
+# Validate sshd syntax before restarting
+if sshd -t; then
+    systemctl restart ssh
+else
+    echo "[!] SSH config syntax error detected! Restoring backup..."
+    cp /root/.backup_auth/sshd_config /etc/ssh/sshd_config
+    systemctl restart ssh
 fi
 
-mkdir -p /etc/systemd/system/${FALCO_UNIT}.d
-cat << EOF > /etc/systemd/system/${FALCO_UNIT}.d/override.conf
-[Service]
-Restart=always
-RestartSec=5
-EOF
+# 4. Prevent Creation of New Users
+echo "[*] Locking user database files and account creation binaries..."
+# Restrict chmod on useradd/adduser
+chmod 000 /usr/sbin/useradd /usr/sbin/adduser /usr/sbin/groupadd /usr/sbin/newusers 2>/dev/null
 
-mkdir -p /etc/systemd/system/wazuh-agent.service.d
-cat << 'EOF' > /etc/systemd/system/wazuh-agent.service.d/override.conf
-[Service]
-Restart=always
-RestartSec=5
-EOF
+# Make user/group databases immutable (even root cannot add users without removing +i first)
+chattr +i /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers
+chattr -R +i /etc/sudoers.d 2>/dev/null
 
-systemctl daemon-reload
-systemctl enable --now "${FALCO_UNIT}"
-systemctl enable --now wazuh-agent
+# 5. Self-Deletion & Anti-Forensics (History Wipe)
+echo "[*] Shredding script and wiping command histories..."
+shred -u -z -n 3 "$SCRIPT_PATH" 2>/dev/null || rm -f "$SCRIPT_PATH"
 
-# Web directory permissions lockdown for PlinkCom web root
-if [ -d /var/www/html ]; then
-  chown -R root:root /var/www/html
-  find /var/www/html -type d -exec chmod 755 {} \;
-  find /var/www/html -type f -exec chmod 644 {} \;
-fi
+# Wipe bash, zsh, and python/mysql/less histories across root and all user profiles
+history_files=(
+    "/root/.*_history"
+    "/home/*/.*_history"
+    "/root/.lesshst"
+    "/home/*/.lesshst"
+    "/root/.viminfo"
+    "/home/*/.viminfo"
+)
 
-# Permission hardening & AppArmor
-chmod 700 /usr/bin/wget 2>/dev/null || true
-chmod 700 /usr/bin/curl 2>/dev/null || true
-aa-enforce /etc/apparmor.d/* 2>/dev/null || true
+for pattern in "${history_files[@]}"; do
+    for file in $pattern; do
+        if [[ -f "$file" ]]; then
+            shred -u -z -n 1 "$file" 2>/dev/null || rm -f "$file"
+        fi
+    done
+done
 
-# Kernel security hardening (sysctl)
-cat << 'EOF' > /etc/sysctl.d/99-security-hardening.conf
-kernel.kptr_restrict=2
-kernel.unprivileged_bpf_disabled=1
-net.core.bpf_jit_harden=2
-fs.protected_hardlinks=1
-fs.protected_symlinks=1
-EOF
-sysctl --system
+# Truncate current session history and disable history logging for active shells
+export HISTSIZE=0
+export HISTFILESIZE=0
+unset HISTFILE
+history -c
+history -w
 
-# Tools download
-curl -L -o pspy64 https://github.com/DominicBreuker/pspy/releases/latest/download/pspy64
-chmod +x pspy64
-sudo mv pspy64 /usr/local/bin/
-
-# System integrity audit
-echo "Running system integrity audit..."
-debsums_init 2>/dev/null || true
-debsums -ca 2>/dev/null > /var/log/debsums_audit.log || true
-chmod 600 /var/log/debsums_audit.log
-
-# ==============================================================================
-# 5. NORMAL FIREWALL CONFIGURATION (FINAL PRODUCTION STATE FOR .10)
-# ==============================================================================
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-
-# Production ports: SSH, HTTP port 80 communication with 172.16.4.10, outbound DB to Manifest (.40 port 3306), blocking Metasploit
-ufw allow in 22/tcp comment 'Allow SSH'
-ufw allow from 172.16.4.10 to any port 80 proto tcp comment 'Allow HTTP communication with 172.16.4.10'
-ufw allow out to 172.16.0.0/16 proto tcp to port 3306 comment 'Allow outbound DB access to Manifest'
-ufw deny 443/tcp comment 'Block HTTPS if not used'
-ufw deny 4444/tcp comment 'Block Metasploit'
-ufw --force enable
-
-# ==============================================================================
-# 6. SYSTEM IMMUTABILITY & CLEANUP
-# ==============================================================================
-chattr +i /lib/systemd/system/${FALCO_UNIT} 2>/dev/null || true
-chattr +i /usr/lib/systemd/system/${FALCO_UNIT} 2>/dev/null || true
-chattr +i /etc/systemd/system/${FALCO_UNIT}.d/override.conf 2>/dev/null || true
-
-chattr +i /lib/systemd/system/wazuh-agent.service 2>/dev/null || true
-chattr +i /usr/lib/systemd/system/wazuh-agent.service 2>/dev/null || true
-chattr +i /etc/systemd/system/wazuh-agent.service.d/override.conf 2>/dev/null || true
-
-chattr +i /var/ossec/etc/ossec.conf 2>/dev/null || true
-chattr +i /etc/falco/falco.yaml 2>/dev/null || true
-
-chattr -R +i /etc/apt/trusted.gpg.d/ 2>/dev/null || true
-chattr -R +i /usr/share/keyrings/ 2>/dev/null || true
-chattr +i /etc/apt/sources.list 2>/dev/null || true
-chattr -R +i /etc/apt/sources.list.d/ 2>/dev/null || true
-chattr +i /etc/ssh/sshd_config
-
-export HISTFILE=/dev/null
-set +o history 2>/dev/null || true
-> ~/.bash_history
-
-echo "Hardening sequence complete for guidance-t (.10). All users updated to password \$neverhacked, fail2ban removed, and IP references updated."
+echo "[+] Hardening complete."
