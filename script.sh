@@ -1,144 +1,68 @@
 #!/bin/bash
-# Ubuntu 22.04 Blue Team Hardening Script
+# Comprehensive Hardening Script for Fedora 38 (ignition-t)
+# Horse Plinko Cyber Challenge
 
-if [[ $EUID -ne 0 ]]; then
-   echo "Error: This script must be run as root." 
-   exit 1
+# Ensure script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "[-] Please run as root."
+  exit 1
 fi
 
-SCRIPT_PATH="$(realpath "$0")"
-TARGET_PASS='plink$1234'
-ALLOWED_USERS=("jmoney" "plinktern")
+echo "[+] Starting comprehensive system hardening on Fedora 38 (ignition-t)..."
 
-echo "[*] Backing up critical auth files to /root/.backup_auth..."
-mkdir -p /root/.backup_auth
-cp /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/ssh/sshd_config /root/.backup_auth/
-chmod 600 /root/.backup_auth/*
+# 1. Update packages to fix OS vulnerabilities
+echo "[+] Step 1: Updating system packages..."
+dnf upgrade --refresh -y
 
-# 1. User Management & Password Enforcement
-echo "[*] Ensuring allowed users exist and setting passwords..."
-for user in "${ALLOWED_USERS[@]}"; do
-    if ! id "$user" &>/dev/null; then
-        useradd -m -s /bin/bash "$user"
-    fi
-    # Single quotes around TARGET_PASS prevent $1234 variable expansion
-    echo "${user}:${TARGET_PASS}" | chpasswd
-    passwd -u "$user" 2>/dev/null
+# 2. User Account Cleanup and Required Password Setting
+echo "[+] Step 2: Cleaning up user accounts and setting required credentials..."
+for user in $(awk -F: '$3 >= 1000 && $1 != "jmoney" && $1 != "plinktern" {print $1}' /etc/passwd); do
+    echo "[*] Removing unauthorized user: $user"
+    userdel -r "$user" 2>/dev/null || userdel "$user"
 done
 
-# Ensure root has the known password so it isn't passwordless
-echo "root:${TARGET_PASS}" | chpasswd
+# Set required passwords for plinktern and jmoney
+echo "plinktern:plink\$1234" | chpasswd
+echo "jmoney:plink\$1234" | chpasswd
 
-echo "[*] Removing unauthorized human users (UID >= 1000)..."
-# Only target standard users (UID >= 1000) to avoid breaking system/Apache daemons (www-data, sshd, etc.)
-awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd | while read -r user; do
-    if [[ "$user" != "jmoney" && "$user" != "plinktern" ]]; then
-        echo "[-] Deleting unauthorized user: $user"
-        pkill -KILL -u "$user" 2>/dev/null
-        userdel -r -f "$user" 2>/dev/null
-    fi
-done
+# Enforce system-wide password policies in login.defs
+sed -i 's/^PASS_MIN_LEN.*/PASS_MIN_LEN 8/' /etc/login.defs
+sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD SHA512/' /etc/login.defs
 
-echo "[*] Locking passwordless accounts and enforcing password requirement..."
-# Lock any system account that has an empty password field in /etc/shadow
-awk -F: '($2 == "" ) {print $1}' /etc/shadow | while read -r empty_user; do
-    if [[ "$empty_user" != "jmoney" && "$empty_user" != "plinktern" && "$empty_user" != "root" ]]; then
-        passwd -l "$empty_user" 2>/dev/null
-    fi
-done
+# 3. Firewall Configuration (firewalld)
+echo "[+] Step 3: Configuring firewalld..."
+systemctl enable --now firewalld
+firewall-cmd --set-default-zone=public
 
-# Remove nullok from PAM so blank passwords cannot authenticate anywhere
-sed -i 's/\bnullok\b//g' /etc/pam.d/common-auth
-sed -i 's/\bnullok_secure\b//g' /etc/pam.d/common-auth
+# Allow required services and ports
+firewall-cmd --permanent --add-service=ssh
+firewall-cmd --permanent --add-service=http
+firewall-cmd --permanent --add-service=https
+firewall-cmd --permanent --add-port=8080/tcp
 
-# 2. Firewall Configuration (UFW) & Apache2
-echo "[*] Configuring UFW for SSH (22) and Apache2 (80, 443)..."
-apt-get update -y && apt-get install -y ufw apache2
+# Allow the internal competition subnet
+firewall-cmd --permanent --add-source=172.16.0.0/16
 
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw --force enable
+firewall-cmd --reload
+echo "[+] Firewall rules applied successfully."
 
-echo "[*] Ensuring Apache2 service is active..."
-systemctl enable apache2
-systemctl restart apache2
+# 4. Ensure SSH remains active and running
+echo "[+] Step 4: Verifying SSH service..."
+systemctl enable --now sshd
+systemctl restart sshd
 
-# 3. SSH Hardening
-echo "[*] Hardening SSH configuration..."
-SSHD_CONF="/etc/ssh/sshd_config"
+# 5. Restrict User Creation Binaries
+echo "[+] Step 5: Restricting user creation binaries..."
+chmod 700 /usr/sbin/useradd /usr/sbin/adduser /usr/sbin/usermod
 
-# Remove conflicting directives in drop-in directory (Ubuntu 22.04 often overrides PasswordAuthentication here)
-rm -f /etc/ssh/sshd_config.d/*.conf
+# 6. Apply Immutability to Core Shell and System Commands
+echo "[+] Step 6: Applying immutable flags to core commands..."
+chattr +i /bin/bash /bin/sh /usr/bin/sudo /usr/bin/passwd /usr/bin/su
 
-sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD_CONF"
-sed -i -E 's/^#?PermitEmptyPasswords.*/PermitEmptyPasswords no/' "$SSHD_CONF"
-sed -i -E 's/^#?PubkeyAuthentication.*/PubkeyAuthentication no/' "$SSHD_CONF"
-sed -i -E 's/^#?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' "$SSHD_CONF"
-sed -i -E 's/^#?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$SSHD_CONF"
-sed -i -E 's/^#?PermitRootLogin.*/PermitRootLogin no/' "$SSHD_CONF"
-sed -i -E 's/^#?UsePAM.*/UsePAM yes/' "$SSHD_CONF"
+echo "[+] Hardening complete on ignition-t."
 
-# Explicitly append directives if they weren't present in the file
-grep -q "^PasswordAuthentication" "$SSHD_CONF" || echo "PasswordAuthentication yes" >> "$SSHD_CONF"
-grep -q "^PermitEmptyPasswords" "$SSHD_CONF" || echo "PermitEmptyPasswords no" >> "$SSHD_CONF"
-grep -q "^PubkeyAuthentication" "$SSHD_CONF" || echo "PubkeyAuthentication no" >> "$SSHD_CONF"
-
-# Restrict SSH login strictly to the two required accounts
-sed -i '/^AllowUsers/d' "$SSHD_CONF"
-echo "AllowUsers jmoney plinktern" >> "$SSHD_CONF"
-
-# Wipe authorized_keys to prevent key-based backdoors
-rm -rf /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys 2>/dev/null
-
-# Validate sshd syntax before restarting
-if sshd -t; then
-    systemctl restart ssh
-else
-    echo "[!] SSH config syntax error detected! Restoring backup..."
-    cp /root/.backup_auth/sshd_config /etc/ssh/sshd_config
-    systemctl restart ssh
-fi
-
-# 4. Prevent Creation of New Users
-echo "[*] Locking user database files and account creation binaries..."
-# Restrict chmod on useradd/adduser
-chmod 000 /usr/sbin/useradd /usr/sbin/adduser /usr/sbin/groupadd /usr/sbin/newusers 2>/dev/null
-
-# Make user/group databases immutable (even root cannot add users without removing +i first)
-chattr +i /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers
-chattr -R +i /etc/sudoers.d 2>/dev/null
-
-# 5. Self-Deletion & Anti-Forensics (History Wipe)
-echo "[*] Shredding script and wiping command histories..."
-shred -u -z -n 3 "$SCRIPT_PATH" 2>/dev/null || rm -f "$SCRIPT_PATH"
-
-# Wipe bash, zsh, and python/mysql/less histories across root and all user profiles
-history_files=(
-    "/root/.*_history"
-    "/home/*/.*_history"
-    "/root/.lesshst"
-    "/home/*/.lesshst"
-    "/root/.viminfo"
-    "/home/*/.viminfo"
-)
-
-for pattern in "${history_files[@]}"; do
-    for file in $pattern; do
-        if [[ -f "$file" ]]; then
-            shred -u -z -n 1 "$file" 2>/dev/null || rm -f "$file"
-        fi
-    done
-done
-
-# Truncate current session history and disable history logging for active shells
-export HISTSIZE=0
-export HISTFILESIZE=0
-unset HISTFILE
+# 7. Clear history and self-destruct
 history -c
 history -w
-
-echo "[+] Hardening complete."
+unset HISTFILE
+rm -- "$0"
